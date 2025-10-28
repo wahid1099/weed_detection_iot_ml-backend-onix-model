@@ -4,3 +4,4 @@ onnxruntime
 pillow
 numpy
 opencv-python-headless
+python-multipart
