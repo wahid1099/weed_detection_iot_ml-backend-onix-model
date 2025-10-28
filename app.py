@@ -1,12 +1,41 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn, io, base64
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn, io, base64, json
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import onnxruntime as ort
 import cv2
+import asyncio
+from typing import List
 
 app = FastAPI(title="YOLOv8 Weed Detection API + UI")
+
+# Add CORS middleware for Flutter app integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your Flutter app's domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# WebSocket connection manager for real-time detection
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+manager = ConnectionManager()
 
 # Load ONNX model - use quantized model if available
 try:
@@ -276,6 +305,165 @@ async def predict(file: UploadFile = File(...)):
         print(f"Prediction error: {e}")
         import traceback
         traceback.print_exc()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# -------------------------------
+# WebSocket endpoint for real-time detection
+# -------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Receive base64 image data from Flutter
+            data = await websocket.receive_text()
+            
+            try:
+                # Parse the received data
+                message = json.loads(data)
+                image_data = message.get('image')
+                
+                if image_data:
+                    # Decode base64 image
+                    image_bytes = base64.b64decode(image_data.split(',')[-1])
+                    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    
+                    # Run detection (reuse existing logic)
+                    orig_w, orig_h = image.size
+                    input_tensor = preprocess(image)
+                    
+                    if session is not None:
+                        # Run inference
+                        input_name = session.get_inputs()[0].name
+                        outputs = session.run(None, {input_name: input_tensor})
+                        
+                        # Process results (simplified for real-time)
+                        predictions = outputs[0][0].T
+                        
+                        detections = []
+                        for prediction in predictions:
+                            x_center, y_center, width, height = prediction[:4]
+                            class_scores = prediction[4:]
+                            max_score = np.max(class_scores)
+                            
+                            if max_score > 0.3:  # Higher threshold for real-time
+                                class_id = np.argmax(class_scores)
+                                x1 = int((x_center - width / 2) * orig_w / 640)
+                                y1 = int((y_center - height / 2) * orig_h / 640)
+                                x2 = int((x_center + width / 2) * orig_w / 640)
+                                y2 = int((y_center + height / 2) * orig_h / 640)
+                                
+                                detections.append({
+                                    "x1": max(0, x1),
+                                    "y1": max(0, y1),
+                                    "x2": min(orig_w, x2),
+                                    "y2": min(orig_h, y2),
+                                    "confidence": float(max_score),
+                                    "class_id": int(class_id),
+                                    "class_name": ["Clover", "Crabgrass", "Gamochaeta", "Sphagneticola", "Syndrella"][class_id]
+                                })
+                        
+                        # Send results back
+                        response = {
+                            "type": "detection_result",
+                            "detections": detections,
+                            "detection_count": len(detections),
+                            "timestamp": message.get('timestamp', '')
+                        }
+                        
+                        await manager.send_personal_message(json.dumps(response), websocket)
+                    
+            except Exception as e:
+                error_response = {
+                    "type": "error",
+                    "message": str(e)
+                }
+                await manager.send_personal_message(json.dumps(error_response), websocket)
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+# -------------------------------
+# Additional API endpoints for Flutter integration
+# -------------------------------
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "model_loaded": session is not None,
+        "timestamp": "2024-01-01T00:00:00Z"
+    }
+
+@app.get("/classes")
+async def get_classes():
+    """Get available weed classes"""
+    return {
+        "classes": [
+            {"id": 0, "name": "Clover"},
+            {"id": 1, "name": "Crabgrass"},
+            {"id": 2, "name": "Gamochaeta"},
+            {"id": 3, "name": "Sphagneticola"},
+            {"id": 4, "name": "Syndrella"}
+        ]
+    }
+
+@app.post("/predict_fast")
+async def predict_fast(file: UploadFile = File(...)):
+    """Fast prediction endpoint with minimal processing for mobile apps"""
+    if session is None:
+        return JSONResponse(content={"error": "Model not loaded"}, status_code=500)
+    
+    try:
+        # Read and preprocess image
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        orig_w, orig_h = image.size
+        
+        # Quick preprocessing
+        input_tensor = preprocess(image)
+        
+        # Run inference
+        input_name = session.get_inputs()[0].name
+        outputs = session.run(None, {input_name: input_tensor})
+        
+        # Fast processing - no NMS, just top detections
+        predictions = outputs[0][0].T
+        
+        detections = []
+        for prediction in predictions:
+            x_center, y_center, width, height = prediction[:4]
+            class_scores = prediction[4:]
+            max_score = np.max(class_scores)
+            
+            if max_score > 0.25:
+                class_id = np.argmax(class_scores)
+                x1 = int((x_center - width / 2) * orig_w / 640)
+                y1 = int((y_center - height / 2) * orig_h / 640)
+                x2 = int((x_center + width / 2) * orig_w / 640)
+                y2 = int((y_center + height / 2) * orig_h / 640)
+                
+                detections.append({
+                    "x1": max(0, x1),
+                    "y1": max(0, y1),
+                    "x2": min(orig_w, x2),
+                    "y2": min(orig_h, y2),
+                    "confidence": float(max_score),
+                    "class_id": int(class_id)
+                })
+        
+        # Sort by confidence and take top 10
+        detections.sort(key=lambda x: x['confidence'], reverse=True)
+        detections = detections[:10]
+        
+        return JSONResponse({
+            "detections": detections,
+            "detection_count": len(detections),
+            "processing_time_ms": "fast",
+            "original_size": {"width": orig_w, "height": orig_h}
+        })
+
+    except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # -------------------------------
