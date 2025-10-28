@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: yolo-weed-detection
+    env: docker
+    plan: free
+    autoDeploy: true

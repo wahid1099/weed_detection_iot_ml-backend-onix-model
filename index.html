@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>YOLOv8 Weed Detection</title>
+    <style>
+      body {
+        font-family: Arial;
+        text-align: center;
+        margin-top: 40px;
+      }
+      #preview {
+        margin-top: 20px;
+        width: 60%;
+        border-radius: 10px;
+      }
+      button {
+        padding: 10px 20px;
+        margin-top: 10px;
+        font-size: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🌿 YOLOv8 Weed Detection Demo</h1>
+    <input type="file" id="fileInput" accept="image/*" /><br />
+    <button onclick="uploadImage()">Detect</button>
+
+    <div id="result"></div>
+    <img id="preview" />
+
+    <script>
+      async function uploadImage() {
+        const fileInput = document.getElementById("fileInput");
+        const resultDiv = document.getElementById("result");
+        const preview = document.getElementById("preview");
+        if (!fileInput.files.length) return alert("Please select an image.");
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+
+        resultDiv.innerHTML = "Processing...";
+        const response = await fetch("/predict", {
+          method: "POST",
+          body: formData,
+        });
+        const data = await response.json();
+
+        if (data.image_base64) {
+          preview.src = data.image_base64;
+          resultDiv.innerHTML = `<p>Detections: ${data.detections.length}</p>`;
+        } else {
+          resultDiv.innerHTML = `<p>Error: ${data.error}</p>`;
+        }
+      }
+    </script>
+  </body>
+</html>
